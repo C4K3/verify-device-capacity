@@ -6,10 +6,16 @@ use rand_chacha::ChaCha12Rng;
 
 use structopt::StructOpt;
 
+use crossterm::tty::IsTty;
+use crossterm::ExecutableCommand;
+
 use std::convert::TryInto;
 use std::fs::File;
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
+
+const UPDATE_FREQUENCY: Duration = Duration::from_secs(60);
 
 /// Write a pseudorandom string of bytes to the given device. Then try to read them back to confirm
 /// they match what was originally written.
@@ -58,7 +64,7 @@ fn _main() -> Result<()> {
     if let Some(input_seed) = &args.seed {
         eprintln!("Using seed {}", input_seed);
     } else {
-        eprintln!("Using raw seed {}", hex::encode(&seed));
+        eprintln!("Using raw seed {}", hex::encode(seed));
     };
     let rng = ChaCha12Rng::from_seed(seed);
 
@@ -69,8 +75,15 @@ fn _main() -> Result<()> {
         )
     })?;
 
+    let disk_size = get_disk_size(&args.device).with_context(|| {
+        format!(
+            "Unable to get disk size of device at '{}'",
+            args.device.display()
+        )
+    })?;
+
     if args.write {
-        eprintln!("Will write random stream of data to device '{}'. This will overwrite all data on the device. Are you sure you want to continue? (y/N)", args.device.display());
+        eprintln!("Will write pseudo-random stream of data to device '{}'. This will overwrite all data on the device. Are you sure you want to continue? (y/N)", args.device.display());
         let mut response = String::new();
         std::io::stdin()
             .read_line(&mut response)
@@ -81,24 +94,28 @@ fn _main() -> Result<()> {
         }
     }
 
-    let mut written_bytes = None;
     if args.write {
-        written_bytes = Some(
-            write_device(&args, rng.clone(), block_size)
-                .with_context(|| format!("Error writing to device '{}'", args.device.display()))?,
-        );
+        let written_bytes = write_device(&args, rng.clone(), block_size, disk_size)
+            .with_context(|| format!("Error writing to device '{}'", args.device.display()))?;
+        if written_bytes != disk_size {
+            bail!(
+                "Wrote {} bytes, but expected disk size to be {} bytes",
+                written_bytes,
+                disk_size
+            );
+        }
     }
 
-    let mut read_bytes = None;
     if args.read {
-        read_bytes =
-            Some(read_device(&args, rng, block_size).with_context(|| {
-                format!("Error reading from device '{}'", args.device.display())
-            })?);
-    }
-    if let (Some(written), Some(read)) = (written_bytes, read_bytes) {
-        if written != read {
-            bail!("Number of read bytes does not match number of written bytes. Wrote {} bytes but read {} bytes.", written, read);
+        let read_bytes = read_device(&args, rng, block_size, disk_size)
+            .with_context(|| format!("Error reading from device '{}'", args.device.display()))?;
+
+        if read_bytes != disk_size {
+            bail!(
+                "Read {} bytes, but expected disk size to be {} bytes",
+                read_bytes,
+                disk_size
+            );
         }
     }
 
@@ -147,18 +164,56 @@ fn get_block_size(path: &Path) -> Result<u64> {
         bail!("Not a block device");
     }
 
-    Ok(metadata.blksize())
+    let block_size = metadata.blksize();
+
+    eprintln!("Disk block size is {} bytes", block_size);
+
+    Ok(block_size)
 }
 
-fn write_device(args: &Args, mut rng: ChaCha12Rng, block_size: u64) -> Result<usize> {
+fn get_disk_size(path: &Path) -> Result<u64> {
+    let mut d = File::open(path)?;
+    d.seek(SeekFrom::End(0))?;
+    let size = d.stream_position()?;
+    eprintln!("Disk size is {} bytes", size);
+    Ok(size)
+}
+
+fn write_device(args: &Args, mut rng: ChaCha12Rng, block_size: u64, disk_size: u64) -> Result<u64> {
     let mut d = File::create(&args.device)?;
     let mut buf = vec![0; block_size as usize];
 
-    eprintln!("Writing to device {}", args.device.display());
+    let tty = std::io::stderr().is_tty();
 
-    let mut written_bytes = 0;
+    eprintln!("Writing to device {}", args.device.display());
+    if tty {
+        eprintln!();
+    }
+
+    let mut written_bytes: usize = 0;
+    let mut last_update = Instant::now();
+    let mut last_update_bytes = 0;
     loop {
-        rng.try_fill_bytes(&mut buf)?;
+        if tty {
+            let duration = last_update.elapsed();
+            if duration > UPDATE_FREQUENCY {
+                let newly_written_bytes = written_bytes - last_update_bytes;
+                let rate = (newly_written_bytes as f64) / duration.as_secs_f64();
+                let completion = (written_bytes as f64) / (disk_size as f64);
+                std::io::stderr()
+                    .execute(crossterm::cursor::MoveToPreviousLine(1))
+                    .context("Error moving cursor")?;
+                eprintln!(
+                    "Written {} bytes total. {:.0} bytes/second. {:.4} complete.",
+                    written_bytes, rate, completion
+                );
+                last_update = Instant::now();
+                last_update_bytes = written_bytes;
+            }
+        }
+
+        rng.try_fill_bytes(&mut buf)
+            .context("Error generating random bytes")?;
 
         let mut to_write = buf.as_slice();
         while !to_write.is_empty() {
@@ -178,7 +233,9 @@ fn write_device(args: &Args, mut rng: ChaCha12Rng, block_size: u64) -> Result<us
                         if error_code == 28 {
                             eprintln!("Successfully wrote {} bytes", written_bytes);
                             d.sync_all().context("Error while trying to call fsync")?;
-                            return Ok(written_bytes);
+                            return written_bytes
+                                .try_into()
+                                .context("usize could not be converted to u64");
                         }
                     }
 
@@ -192,19 +249,46 @@ fn write_device(args: &Args, mut rng: ChaCha12Rng, block_size: u64) -> Result<us
     }
 }
 
-fn read_device(args: &Args, mut rng: ChaCha12Rng, block_size: u64) -> Result<usize> {
+fn read_device(args: &Args, mut rng: ChaCha12Rng, block_size: u64, disk_size: u64) -> Result<u64> {
     let mut d = File::open(&args.device)?;
     let mut device_buf = vec![0; block_size as usize];
     let mut rng_buf = vec![0; block_size as usize];
 
-    eprintln!("Reading from device {}", args.device.display());
+    let tty = std::io::stderr().is_tty();
 
-    let mut read_bytes = 0;
+    eprintln!("Reading from device {}", args.device.display());
+    if tty {
+        eprintln!();
+    }
+
+    let mut read_bytes: usize = 0;
+    let mut last_update = Instant::now();
+    let mut last_update_bytes = 0;
     loop {
+        if tty {
+            let duration = last_update.elapsed();
+            if duration > UPDATE_FREQUENCY {
+                let newly_read_bytes = read_bytes - last_update_bytes;
+                let rate = (newly_read_bytes as f64) / duration.as_secs_f64();
+                let completion = (read_bytes as f64) / (disk_size as f64);
+                std::io::stderr()
+                    .execute(crossterm::cursor::MoveToPreviousLine(1))
+                    .context("Error moving cursor")?;
+                eprintln!(
+                    "Read {} bytes total. {:.0} bytes/second. {:.4} complete.",
+                    read_bytes, rate, completion
+                );
+                last_update = Instant::now();
+                last_update_bytes = read_bytes;
+            }
+        }
+
         let len = match d.read(&mut device_buf) {
             Ok(0) => {
                 eprintln!("Successfully read and matched {} bytes", read_bytes);
-                return Ok(read_bytes);
+                return read_bytes
+                    .try_into()
+                    .context("usize could not be converted to u64");
             }
             Ok(x) => x,
             Err(e) => {
